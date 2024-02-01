@@ -224,7 +224,6 @@ if __name__ == "__main__":
         for i, yr in enumerate(dat.keys()):
             # yr=2020
             time_collabo = {}  # Reset for each year
-            inst_collabo = {}  # Reset for each year
             dates_in_year = []  # List to keep track of dates for papers in this year
             new_collabs_this_year = set() # Track new collaborators for this year
 
@@ -286,8 +285,8 @@ if __name__ == "__main__":
                     'author_age_i': i,
                     'cited_by_count': work['cited_by_count'],
                     'target_type': target_name+"-"+'paper',
-                    'target_position': target_position,
-                    's2FieldsOfStudy': paper_details['s2FieldsOfStudy']
+                    'target_position': target_position
+                    # 's2FieldsOfStudy': paper_details['s2FieldsOfStudy']
                     })
 
 
