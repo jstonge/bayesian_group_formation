@@ -11,6 +11,7 @@ from datetime import datetime
 import random
 import calendar
 import requests
+import pandas as pd
 from creds import s2orc_token
 import re
 
@@ -182,8 +183,8 @@ if __name__ == "__main__":
     # Get embeddings for papers
 
     output_dir=Path(".cache_paper")
-    all_fnames=list(Path(".cache_author").glob("*"))
-    done_papers=[_.stem for _ in output_dir.glob("*")]
+    all_fnames=list(Path(".cache_author").glob("*jsonl"))
+    done_papers=[_.stem for _ in output_dir.glob("*jsonl")]
     all_fnames = [f for f in all_fnames if f.stem not in done_papers]
     
     if not output_dir.exists():
@@ -278,7 +279,7 @@ if __name__ == "__main__":
                     'target': target_name,
                     'year': shuffled_date,
                     'pub_year': work['publication_year'],
-                    'doi': work['ids']['doi'],
+                    # 'doi': work['ids']['doi'],
                     'title': work['title'],
                     'author': ', '.join([_['author']['display_name'] for _ in work['authorships']]),
                     'author_age': shuffled_auth_age,
@@ -367,3 +368,8 @@ if __name__ == "__main__":
     #             if myd is not None:
     #                 if myd['embedding'] is not None:
     #                     meta.append([myd['title'],myd['s2FieldsOfStudy'][0]['category'] if len(myd['s2FieldsOfStudy']) > 0 else None])
+
+    # with open(f"test.json", "w") as f:
+    #     json.dump(out[:3000], f)
+    # with open(f"test_meta.json", "w") as f:
+    #     json.dump(meta[:3000], f)
