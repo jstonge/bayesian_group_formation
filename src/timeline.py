@@ -8,14 +8,11 @@ from pathlib import Path
 from time import sleep
 import argparse
 from datetime import datetime
-from itertools import combinations
 import random
-import csv
 import calendar
-import requests
-import pandas as pd
-from creds import s2orc_token
 import re
+
+from helpers import read_jsonl, write_jsonl, flatten
 
 # put your own please
 pyalex.config.email = "jstonge1@uvm.edu"
@@ -36,24 +33,6 @@ def shuffle_date_within_month(date_str):
 
     # Return the date in the desired format
     return shuffled_date.strftime("%Y-%m-%d")
-
-def read_jsonl(fname):
-    out=[]
-    with open(fname, 'r') as file:
-        # Read each line in the file
-        for line in file:
-            # Parse the JSON string and add the resulting dictionary to the list
-            out.append(json.loads(line))
-    return out
-
-def write_jsonl(fname, out):
-    with open(fname, 'a') as file:
-        for entry in out:
-            json_line = json.dumps(entry)
-            file.write(json_line + '\n')
-
-def flatten(l):
-    return [item for sublist in l for item in sublist]
 
 def find_all_colabs(aid, author_work, names=False):
     """find all the collaborators of that author at time t"""
@@ -109,24 +88,6 @@ def read_cache(target_aid, cache):
             out.update({yr: read_jsonl(cache_f)})
     return out
 
-def get_paper_data(ids):
-  url = f'https://api.semanticscholar.org/graph/v1/paper/batch'
-
-  # Define which details about the paper you would like to receive in the response
-  params = {
-      'fields': 'externalIds,title,year,citationCount,influentialCitationCount,venue,s2FieldsOfStudy,embedding.specter_v2'
-      }
-
-  # Send the API request and store the response in a variable
-  response = requests.post(url, 
-                           headers= {"x-api-key" : f'{s2orc_token}' },
-                           params=params, 
-                           json={'ids': ids})
-  if response.status_code == 200:
-    return response.json()
-  else:
-    print(response.status_code)
-    return None
 
 def get_author_data(target_aid, cache):
     """cache must be in ['author', 'author_bg']"""
@@ -153,126 +114,12 @@ def get_author_data(target_aid, cache):
             f.write("\n")
             f.write(f"{target_aid}")
 
-def write_paper_s2orc(fname):
-    # fname=all_fnames[4]
-    fout = Path(output_dir / f"{fname.stem}.jsonl")
-    if not fout.exists(): 
-        print(fname)
-        paper_dat=read_jsonl(fname)
-        if paper_dat is not None:
-            ids=[]
-            for p in paper_dat:
-                # p=paper_dat[0]
-                if 'doi' in p['ids']:
-                    ids+=["DOI:"+re.sub("https://doi.org/", "", p['ids']['doi'])]
-                elif 'mag' in p['ids']:
-                    ids+=["MAG:"+p['ids']['mag']]
-                else:
-                    print(f"no doi or mag for {p['title']}")
-                    continue
-                
-            paper_detail=get_paper_data(ids)
-            
-            with open(fout, "w") as f:
-                json.dump(paper_detail, f)
-        else:
-            print(f"no data for {fname.stem}")
-
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--target_author", type=str, default="A5035455593")
     args = argparser.parse_args()
     target_aid=args.target_author
-    
-
-    ## GET PAPERS FOR BACKGROUND WITH PAPER-FIRST EMBEDDING 
-    
-    # We first randomly select 10k papers from the openAlex DB
-    from pymongo import MongoClient
-    uri = f"mongodb://cwward:password@wranglerdb01a.uvm.edu:27017/?authSource=admin&readPreference=primary&appname=MongoDB%20Compass&directConnection=true&ssl=false"
-    client = MongoClient(uri)
-    db = client['papersDB']
-    pipeline = [
-        { '$sample': { 'size': 10000 } },
-        { '$match': { 'doi': { '$ne': None, '$exists': True } } },
-        { '$project': { 'doi': 1, '_id': 0 } } 
-    ]
-    result = list(db['works_oa'].aggregate(pipeline, maxTimeMS=60000, allowDiskUse=True))
-    batch_size = 100
-    all_papers = []
-    output_bg = Path(".cache_bg_paper")
-    
-    for i in range(0, len(result), batch_size):
-        ids = ["DOI:"+re.sub("https://doi.org/", "", _['doi']) for _ in result[i:i + batch_size]]
-        # Get paper details using DOIs from the S2ORC API
-        paper_detail = get_paper_data(ids)
-        for paper in paper_detail:
-            # paper = paper_detail[0]
-            if paper is not None:
-                fname_out = output_bg / f"{paper['paperId']}.jsonl"
-                if fname_out.exists() is False:
-                    with open(fname_out, "w") as f:
-                        json.dump(paper, f)
-        sleep(0.5)
-
-    
-    ## GET PAPERS FOR BACKGROUND WITH AUTHOR-FIRST EMBEDDING 
-    
-    # We first randomly select 2k authors from the DB
-    from pymongo import MongoClient
-    uri = f"mongodb://cwward:password@wranglerdb01a.uvm.edu:27017/?authSource=admin&readPreference=primary&appname=MongoDB%20Compass&directConnection=true&ssl=false"
-    client = MongoClient(uri)
-    db = client['papersDB']
-    pipeline = [
-        { '$sample': { 'size': 2000 } },
-        { '$project': { 'id': 1, '_id': 0 } } 
-    ]
-    result = [a['id'].split("/")[-1] for a in db['authors_oa'].aggregate(pipeline)]
-    cache_bg = Path(".cache_bg_author_paper")
-    
-
-    # For each author, we will keep 3 random papers.
-    with open(cache_bg / "done.txt", "w") as f:
-        [f.write(f"{_}\n") for _ in result]
-
-    for chosen_author in tqdm(result, desc="Authors", total=len(result)):
-        i = 0
-        while i <= 3:
-            print('here')
-            # Randomly select a year between 1980 and 2023
-            rdm_yr = np.random.choice(range(1980, 2024))
-            # Within that year, get a random paper for the chosen author
-            q = Works().filter(publication_year=rdm_yr, authorships={"author": {"id": chosen_author}}, doi=True).random()
-            # We will use doi to get the paper details from the S2ORC API
-            if q['doi'] is not None:
-                id = "DOI:"+re.sub("https://doi.org/", "", q['doi'])
-                paper_detail = get_paper_data([id])
-                # We only keep papers found in s2orc and that have embeddings
-                if paper_detail is not None and len(paper_detail) > 0 and paper_detail[0]['embedding'] is not None:
-                    paper_detail = paper_detail[0]
-                    fname_out = cache_bg / f"{paper_detail['paperId']}.jsonl"
-                    if fname_out.exists() is False:
-                        write_jsonl(cache_bg / f"{paper_detail['paperId']}.jsonl", [paper_detail])
-                        i += 1
-            
-            sleep(0.5)
-
-
-    # Get paper for particular authors
-
-    # output_dir=Path(".cache_paper")
-    # all_fnames=list(Path(".cache_author").glob("*jsonl"))
-    # done_papers=[_.stem for _ in output_dir.glob("*jsonl")]
-    # len(done_papers)
-    # all_fnames = [f for f in all_fnames if f.stem not in done_papers]
-    
-    # if not output_dir.exists():
-    #     output_dir.mkdir()
-    
-    # for fname in tqdm(all_fnames):
-    #     write_paper_s2orc(fname)
-    #     sleep(.5)
 
 
     # OUTPUT TO OBSERVABLE 
@@ -625,65 +472,7 @@ if __name__ == "__main__":
     # df = pd.DataFrame(data_to_flatten).fillna(0)
     # df.to_csv("test_ml.csv", index=False)
 
-    # EMBEDDINGS ----------------------------
     
-    # target_aid = 'A5035455593'
-    import umap
-    import numpy as np
-    reducer = umap.UMAP()
-    
-    pap_dir = Path(".cache_paper")
-    bg_pap_dir = Path(".cache_bg_paper")
-    bg_papa_dir = Path(".cache_bg_author_paper")
-    
-    target_aid = 'A5040821463'
-    target_name = Authors()[target_aid]['display_name']
-    # fnames=[_ for _ in bg_pap_dir.glob("*jsonl")]
-    fnames=[_ for _ in bg_papa_dir.glob("*jsonl")]
-    fnames_authors=[_ for _ in pap_dir.glob("*jsonl") if _.stem.split("_")[0] == target_aid]
-    
-    # background = []
-    # for fname in fnames:
-    #     # fname=fnames[0]
-    #     mydat=read_jsonl(fname)
-    #     if mydat is not None and mydat[0] is not None:
-    #         for myd in mydat[0]:
-    #             if myd is not None:
-    #                 if myd['embedding'] is not None:
-                    
-
-    embeddings=[]
-    meta=[]
-    for i,fname in enumerate(fnames+fnames_authors):
-        # fname=fnames[0]
-        # fname=fnames_authors[0]
-        
-        # we want a list of list
-        mydat=[read_jsonl(fname)] if i < len(fnames) else read_jsonl(fname)
-
-        if mydat is not None and mydat[0] is not None:
-            for myd in mydat[0]:
-                if myd is not None:
-                    if myd['embedding'] is not None:
-                        year = myd['year'] if i < len(fnames) else int(fname.stem.split("_")[1])
-                        embeddings.append(myd['embedding']['vector'])
-                        meta.append([
-                            myd['title'],
-                            myd['s2FieldsOfStudy'][0]['category'] if len(myd['s2FieldsOfStudy']) > 0 else None,
-                            year,
-                            True if i < len(fnames) else False
-                            ])
-    
-    # ~700D -> 2D
-    embedding2d = reducer.fit_transform(embeddings)
-    
-    # write to disk
-    pd.concat([
-        pd.DataFrame(embedding2d, columns=["x", "y"]),
-        pd.DataFrame(meta, columns=["title", "fos", "year", "is_background"])
-    ], axis=1).to_parquet("embedding.parquet")
-
-
 
     # BERTOPIC ----------------------------
 
