@@ -8,7 +8,9 @@ from pathlib import Path
 from time import sleep
 import argparse
 from datetime import datetime
+from itertools import combinations
 import random
+import csv
 import calendar
 import requests
 import pandas as pd
@@ -68,9 +70,12 @@ def get_collabs_of_collabs_time_t(target_collabs, target_yr, names=False):
         collabs_of_collabs_time_t += find_all_colabs(aid, out, names=names)
     return set(collabs_of_collabs_time_t)
 
-def get_all_work_time_t(aid, yr):
-    """find all the works of a single target Author at time t"""
-    cache_f = Path(".cache_author") / f'{aid}_{yr}.jsonl'
+def get_all_work_time_t(aid, yr, cache="author"):
+    """
+    Find all the works of a single target Author at time t. 
+    This function calls OpenAlex API
+    """
+    cache_f = Path(f".cache_{cache}") / f'{aid}_{yr}.jsonl'
     if cache_f.exists():
         out = read_jsonl(cache_f)
     else:
@@ -82,7 +87,7 @@ def get_all_work_time_t(aid, yr):
             write_jsonl(cache_f, out)
         else:
             return None
-
+        print(f"We did {len(out)} requests ")
     return out
 
 def determine_home_inst(aid, works):
@@ -94,11 +99,11 @@ def determine_home_inst(aid, works):
                 all_inst_this_year += [i['display_name'] for i in a['institutions']]
     return Counter(all_inst_this_year).most_common(1)[0][0] if len(all_inst_this_year) > 0 else None
 
-def read_cache(target_aid):
+def read_cache(target_aid, cache):
     target_first_yr = auth_known_first_yr[target_aid]
     out = {}
     for yr in range(target_first_yr, 2022):
-        cache_f = Path(f".cache_author/{target_aid}_{yr}.jsonl")
+        cache_f = Path(f".cache_{cache}/{target_aid}_{yr}.jsonl")
 
         if cache_f.exists():
             out.update({yr: read_jsonl(cache_f)})
@@ -108,7 +113,9 @@ def get_paper_data(ids):
   url = f'https://api.semanticscholar.org/graph/v1/paper/batch'
 
   # Define which details about the paper you would like to receive in the response
-  params = {'fields': 'externalIds,title,s2FieldsOfStudy,embedding.specter_v2'}
+  params = {
+      'fields': 'externalIds,title,year,citationCount,influentialCitationCount,venue,s2FieldsOfStudy,embedding.specter_v2'
+      }
 
   # Send the API request and store the response in a variable
   response = requests.post(url, 
@@ -121,15 +128,14 @@ def get_paper_data(ids):
     print(response.status_code)
     return None
 
-def main():
-
-    target_aid=args.target_author
-    with open(".cache_author/done.txt", "r") as f:
+def get_author_data(target_aid, cache):
+    """cache must be in ['author', 'author_bg']"""
+    with open(f".cache_{cache}/done.txt", "r") as f:
         done_authors = f.read().splitlines()
 
     if target_aid not in done_authors: 
         for target_yr in tqdm(range(1950, 2024)):
-            # target author
+            # target author; as many requests as there is work that year.
             target_author_work_time_t = get_all_work_time_t(target_aid, target_yr)
 
             if target_author_work_time_t is None:
@@ -143,7 +149,7 @@ def main():
 
             sleep(1) # politeness
 
-        with open(".cache_author/done.txt", "a") as f:
+        with open(f".cache_{cache}/done.txt", "a") as f:
             f.write("\n")
             f.write(f"{target_aid}")
 
@@ -177,22 +183,96 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--target_author", type=str, default="A5035455593")
     args = argparser.parse_args()
+    target_aid=args.target_author
     
-    main()
 
-    # Get embeddings for papers
+    ## GET PAPERS FOR BACKGROUND WITH PAPER-FIRST EMBEDDING 
+    
+    # We first randomly select 10k papers from the openAlex DB
+    from pymongo import MongoClient
+    uri = f"mongodb://cwward:password@wranglerdb01a.uvm.edu:27017/?authSource=admin&readPreference=primary&appname=MongoDB%20Compass&directConnection=true&ssl=false"
+    client = MongoClient(uri)
+    db = client['papersDB']
+    pipeline = [
+        { '$sample': { 'size': 10000 } },
+        { '$match': { 'doi': { '$ne': None, '$exists': True } } },
+        { '$project': { 'doi': 1, '_id': 0 } } 
+    ]
+    result = list(db['works_oa'].aggregate(pipeline, maxTimeMS=60000, allowDiskUse=True))
+    batch_size = 100
+    all_papers = []
+    output_bg = Path(".cache_bg_paper")
+    
+    for i in range(0, len(result), batch_size):
+        ids = ["DOI:"+re.sub("https://doi.org/", "", _['doi']) for _ in result[i:i + batch_size]]
+        # Get paper details using DOIs from the S2ORC API
+        paper_detail = get_paper_data(ids)
+        for paper in paper_detail:
+            # paper = paper_detail[0]
+            if paper is not None:
+                fname_out = output_bg / f"{paper['paperId']}.jsonl"
+                if fname_out.exists() is False:
+                    with open(fname_out, "w") as f:
+                        json.dump(paper, f)
+        sleep(0.5)
 
-    output_dir=Path(".cache_paper")
-    all_fnames=list(Path(".cache_author").glob("*jsonl"))
-    done_papers=[_.stem for _ in output_dir.glob("*jsonl")]
-    all_fnames = [f for f in all_fnames if f.stem not in done_papers]
     
-    if not output_dir.exists():
-        output_dir.mkdir()
+    ## GET PAPERS FOR BACKGROUND WITH AUTHOR-FIRST EMBEDDING 
     
-    for fname in tqdm(all_fnames):
-        write_paper_s2orc(fname)
-        sleep(.5)
+    # We first randomly select 2k authors from the DB
+    from pymongo import MongoClient
+    uri = f"mongodb://cwward:password@wranglerdb01a.uvm.edu:27017/?authSource=admin&readPreference=primary&appname=MongoDB%20Compass&directConnection=true&ssl=false"
+    client = MongoClient(uri)
+    db = client['papersDB']
+    pipeline = [
+        { '$sample': { 'size': 2000 } },
+        { '$project': { 'id': 1, '_id': 0 } } 
+    ]
+    result = [a['id'].split("/")[-1] for a in db['authors_oa'].aggregate(pipeline)]
+    cache_bg = Path(".cache_bg_author_paper")
+    
+
+    # For each author, we will keep 3 random papers.
+    with open(cache_bg / "done.txt", "w") as f:
+        [f.write(f"{_}\n") for _ in result]
+
+    for chosen_author in tqdm(result, desc="Authors", total=len(result)):
+        i = 0
+        while i <= 3:
+            print('here')
+            # Randomly select a year between 1980 and 2023
+            rdm_yr = np.random.choice(range(1980, 2024))
+            # Within that year, get a random paper for the chosen author
+            q = Works().filter(publication_year=rdm_yr, authorships={"author": {"id": chosen_author}}, doi=True).random()
+            # We will use doi to get the paper details from the S2ORC API
+            if q['doi'] is not None:
+                id = "DOI:"+re.sub("https://doi.org/", "", q['doi'])
+                paper_detail = get_paper_data([id])
+                # We only keep papers found in s2orc and that have embeddings
+                if paper_detail is not None and len(paper_detail) > 0 and paper_detail[0]['embedding'] is not None:
+                    paper_detail = paper_detail[0]
+                    fname_out = cache_bg / f"{paper_detail['paperId']}.jsonl"
+                    if fname_out.exists() is False:
+                        write_jsonl(cache_bg / f"{paper_detail['paperId']}.jsonl", [paper_detail])
+                        i += 1
+            
+            sleep(0.5)
+
+
+    # Get paper for particular authors
+
+    # output_dir=Path(".cache_paper")
+    # all_fnames=list(Path(".cache_author").glob("*jsonl"))
+    # done_papers=[_.stem for _ in output_dir.glob("*jsonl")]
+    # len(done_papers)
+    # all_fnames = [f for f in all_fnames if f.stem not in done_papers]
+    
+    # if not output_dir.exists():
+    #     output_dir.mkdir()
+    
+    # for fname in tqdm(all_fnames):
+    #     write_paper_s2orc(fname)
+    #     sleep(.5)
 
 
     # OUTPUT TO OBSERVABLE 
@@ -205,17 +285,18 @@ if __name__ == "__main__":
     auth_known_first_yr = {auth: 1970 for auth in chosen_authors}
     auth_known_first_yr['A5037256938'] = 2004
     auth_known_first_yr['A5088506012'] = 1988
-    auth_known_first_yr['A5017032627'] = 1950
+    auth_known_first_yr['A5017032627'] = 2000
+    auth_known_first_yr['A5037170969'] = 1950
     auth_known_first_yr['A5027136376'] = 2005
     auth_known_first_yr['A5009266404'] = 2005
     auth_known_first_yr['A5046878011'] = 1987
     auth_known_first_yr['A5017357771'] = 2007
 
     for target_aid in tqdm(chosen_authors):
-        # target_aid = 'A5040821463'
+        # target_aid = 'A5035455593'
         target_name = Authors()[target_aid]['display_name']
         
-        dat = read_cache(target_aid)
+        dat = read_cache(target_aid, cache='author')
 
         set_all_collabs = set()  # Track all collaborators across all years
         set_collabs_of_collabs_never_worked_with = set()
@@ -239,7 +320,7 @@ if __name__ == "__main__":
                 # work=dat[yr][2]
                 if work['type'] != 'article' and work['language'] != 'en':
                     continue
-
+                
                 shuffled_date = shuffle_date_within_month(work['publication_date'])
                 shuffled_auth_age = "1"+shuffled_date.replace(shuffled_date.split("-")[0], str(yr2age[yr]).zfill(3))
                 # impossible leap year causes issues... omg
@@ -279,7 +360,7 @@ if __name__ == "__main__":
                     'target': target_name,
                     'year': shuffled_date,
                     'pub_year': work['publication_year'],
-                    # 'doi': work['ids']['doi'],
+                    'doi': work['ids']['doi'] if 'doi' in work['ids'] else None,
                     'title': work['title'],
                     'author': ', '.join([_['author']['display_name'] for _ in work['authorships']]),
                     'author_age': shuffled_auth_age,
@@ -314,9 +395,7 @@ if __name__ == "__main__":
                     # impossible leap year
                     shuffled_auth_age = shuffled_auth_age.replace("29", "28") if shuffled_auth_age.endswith("29") else shuffled_auth_age
 
-
                     # find coauthor institution name
-                    
                     shared_inst = None
                     max_institution = None
                     if author_data['institutions'] and target_institution:
@@ -336,6 +415,7 @@ if __name__ == "__main__":
                         'all_times_collabo': all_time_collabo[author_name],  # Total collaboration count
                         'shared_institutions': shared_inst,
                         'institutions': max_institution,
+                        'institutions': max_institution,
                         'target_type': target_name+"-"+'coauthor'
                          })
 
@@ -346,30 +426,276 @@ if __name__ == "__main__":
 
 
 
-    # pap_dir = Path(".cache_paper")
-    # fnames=list(pap_dir.glob("*jsonl"))
-
-    # out=[]
-    # for i,fname in enumerate(fnames):
-    #     print(i)
-    #     mydat=read_jsonl(fname)
-    #     if mydat is not None and mydat[0] is not None:
-    #         for myd in mydat[0]:
-    #             if myd is not None:
-    #                 if myd['embedding'] is not None:
-    #                     out.append(myd['embedding']['vector'])
     
-    # meta=[]
-    # for i,fname in enumerate(fnames):
-    #     print(i)
+    
+    # GET MATRIX OF COAUTHORS ----------------------------
+
+    # import xgi
+    # import networkx as nx
+    # from itertools import combinations
+    # import matplotlib.pyplot as plt
+    # import numpy as np
+    
+    # with open("timeline_prod.json") as f:
+    #     data = json.load(f)
+    
+    # def flatten(l):
+    #     return [item for sublist in l for item in sublist]
+    
+    # def plot_matrix_with_legend(mat):
+    #     sorted_indices = np.argsort(-mat.sum(axis=1))
+    #     sorted_mat = mat[sorted_indices][:, sorted_indices]
+
+    #     fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    #     im = ax.imshow(sorted_mat, cmap='Blues', aspect='auto')
+    #     ax.set_xlabel('Coauthor')
+    #     ax.set_ylabel('Coauthor')
+    #     cbar = fig.colorbar(im)
+    #     cbar.set_label('Count')
+    #     plt.show()
+
+    # def get_papers(x):
+    #     return [paper for paper in data 
+    #               if paper['target'] == x 
+    #               and paper['type'] == 'paper' 
+    #               and paper['pub_year'] in chosen_years]
+    
+    # chosen_years = list(range(2019,2022))
+    # lhd_papers = get_papers('Laurent Hébert‐Dufresne')
+    # all_pairs_coauthors = flatten([list(combinations(_['author'].split(", "),2)) for _ in lhd_papers])
+    # uniq_coauthors = set(flatten([_['author'].split(", ") for _ in lhd_papers]))
+    # coauthor2idx = {coauthor: i for i, coauthor in enumerate(uniq_coauthors)}
+    
+    # # all_pairs_coauthors = Counter(all_pairs_coauthors)
+    # mat = np.zeros((len(uniq_coauthors), len(uniq_coauthors))).astype(int)
+    
+    # done_pairs = set()  # Use a set for efficient lookup and handling pairs uniquely
+
+    # for pair in all_pairs_coauthors:
+    #     s, t = pair
+    #     idx_s, idx_t = coauthor2idx[s], coauthor2idx[t]
+
+    #     # Check if the pair or its reverse has been encountered
+    #     if (s, t) in done_pairs or (t, s) in done_pairs:
+    #         # Increment counts symmetrically for both (s, t) and (t, s)
+    #         mat[idx_s, idx_t] += 1
+    #         mat[idx_t, idx_s] += 1
+    #     else:
+    #         # Initialize counts to 1 for both (s, t) and (t, s) if not yet encountered
+    #         mat[idx_s, idx_t] = 1
+    #         mat[idx_t, idx_s] = 1
+    #         # Add both (s, t) and (t, s) to done_pairs to indicate they've been processed
+    #         done_pairs.add((s, t))
+    #         done_pairs.add((t, s))
+
+    # done_papers = [_['doi'] for _ in lhd_papers if _['doi'] is not None]
+
+    # new_mat = mat.copy()
+    # for coauthor in uniq_coauthors:
+    #     x_papers = get_papers(coauthor)
+    #     all_pairs_coauthors = flatten(
+    #         [list(combinations(_['author'].split(", "),2)) for _ in x_papers
+    #          if _['doi'] is not None and _['doi'] not in done_papers]
+    #         )
+
+    #     for pair in all_pairs_coauthors:
+    #         s, t = pair
+    #         if s in uniq_coauthors and t in uniq_coauthors:
+    #             idx_s, idx_t = coauthor2idx[s], coauthor2idx[t]
+
+    #             # Check if the pair or its reverse has been encountered
+    #             if (s, t) in done_pairs or (t, s) in done_pairs:
+    #                 # Increment counts symmetrically for both (s, t) and (t, s)
+    #                 new_mat[idx_s, idx_t] += 1
+    #                 new_mat[idx_t, idx_s] += 1
+    #             else:
+    #                 # Initialize counts to 1 for both (s, t) and (t, s) if not yet encountered
+    #                 new_mat[idx_s, idx_t] = 1
+    #                 new_mat[idx_t, idx_s] = 1
+    #                 # Add both (s, t) and (t, s) to done_pairs to indicate they've been processed
+    #                 done_pairs.add((s, t))
+    #                 done_pairs.add((t, s))
+                    
+    #             done_papers += [_['doi'] for _ in x_papers if _['doi'] is not None]
+   
+    # # right now jsut the coauthors of LHD; and how people within
+    # # with perimeter collaborate with each other.
+    # plot_matrix_with_legend(new_mat)
+
+
+    # OUTPUT SUMMARY SIMPLE ----------------------------
+        
+    # import seaborn as sns
+    # import matplotlib.pyplot as plt
+
+    # group size; density; variance of topic spread 
+        
+    # jgy=[_ for _ in papers if _['target'] == 'Jean-Gabriel Young']
+    # jgy_pap=[_ for _ in jgy if _['type'] == 'paper']
+    # jgy_coauth=[_ for _ in jgy if _['type'] == 'coauthor']
+    # jgy_first_pos=Counter([(_['pub_year'], _['target_position']) for _ in jgy_pap if _['target_position'] == 'first'])
+    # jgy_first_middle=Counter([(_['pub_year'], _['target_position']) for _ in jgy_pap if _['target_position'] == 'middle'])
+    # jgy_first_last=Counter([(_['pub_year'], _['target_position']) for _ in jgy_pap if _['target_position'] == 'last'])
+    # coauth_count=Counter([_['pub_year'] for _ in jgy_coauth])
+    # pap_count=Counter([_['pub_year'] for _ in jgy_pap])
+    # pap_count=Counter([_['pub_year'] for _ in jgy_pap])
+    
+
+    # fig, ax = plt.subplots(1,1)
+    # sns.lineplot(x=pap_count.keys(), y=pap_count.values(), ax=ax)
+    # sns.lineplot(x=[int(_) for _ in coauth_count.keys()], y=coauth_count.values(), ax=ax)
+
+
+    # OUTPUT AUTHOR SUMMARY ----------------------------
+
+    # out = {}
+    # for p in papers:
+    #     #p=papers[202]
+    #     # Define the key for the current paper/coauthor based on target and publication year
+    #     target_year = (p['target'], int(p['pub_year']))
+        
+    #     # Initialize the yearly data structure only if it doesn't exist for the target_year
+    #     if target_year not in out:
+    #         out[target_year] = {
+    #             'target_position': {}, 
+    #             'institutional_diversity': {}, 
+    #             'coauthors': {},
+    #             'age': 0,  # Initialize age; assuming you'll update or use it differently based on your needs
+    #             'institutions': "",
+    #             'number_of_papers': 0  # Initialize the number of papers
+    #         }
+        
+    #     # Retrieve the existing data structure for updates
+    #     yearly_data = out[target_year]
+
+    #     if p['type'] == 'paper':
+    #         # Increment the number of papers
+    #         yearly_data['number_of_papers'] += 1
+
+    #         # Update target_position count
+    #         yearly_data['target_position'][p['target_position']] = yearly_data['target_position'].get(p['target_position'], 0) + 1
+            
+    #         # Update age; assuming last seen age is what you're interested in, otherwise adjust as needed
+    #         yearly_data['age'] = p['author_age_i']
+    #     elif p['type'] == 'coauthor':
+    #         # Increment coauthor count
+    #         coauth_name = p['title']  # Assuming this uniquely identifies the coauthor
+    #         yearly_data['coauthors'][coauth_name] = yearly_data['coauthors'].get(coauth_name, 0) + 1
+
+    #         # Handle institution, treating None as 'Unknown'
+    #         institution = p['institutions'] if p['institutions'] is not None else 'Unknown'
+    #         yearly_data['institutional_diversity'][institution] = yearly_data['institutional_diversity'].get(institution, 0) + 1
+    #         yearly_data['institutions'] = p['shared_institutions']
+
+    # for key, data in out.items():
+    #     # Calculate the number of distinct institutions
+    #     num_institutions = len(data['institutional_diversity'])
+        
+    #     # Calculate the number of coauthors
+    #     num_coauthors = len(data['coauthors'])
+        
+        
+    #     # Calculate the total count of positions
+    #     total_positions = sum(data['target_position'].values())
+        
+    #     # Calculate the proportion of each position
+    #     position_proportions = {position: count / total_positions for position, count in data['target_position'].items()}
+        
+    #     # Update the dictionary with the calculated values
+    #     out[key]['institutional_diversity'] = num_institutions
+    #     out[key]['coauthors'] = num_coauthors
+    #     out[key]['target_position'] = position_proportions
+
+    # data_to_flatten = []
+    # for (target, pub_year), data in out.items():
+    #     # Flatten the target_position proportions into separate fields
+    #     positions_data = {f"position_{k}": v for k, v in data['target_position'].items()}
+    #     row = {
+    #         'target': target,
+    #         'pub_year': pub_year,
+    #         'age': data['age'],
+    #         'nb_papers': data['number_of_papers'],
+    #         'institutional_diversity': data['institutional_diversity'],
+    #         'nb_coauthors': data['coauthors'],
+    #         **positions_data  # Unpack the positions data
+    #     }
+    #     data_to_flatten.append(row)
+
+    # # Create the DataFrame
+    # df = pd.DataFrame(data_to_flatten).fillna(0)
+    # df.to_csv("test_ml.csv", index=False)
+
+    # EMBEDDINGS ----------------------------
+    
+    # target_aid = 'A5035455593'
+    import umap
+    import numpy as np
+    reducer = umap.UMAP()
+    
+    pap_dir = Path(".cache_paper")
+    bg_pap_dir = Path(".cache_bg_paper")
+    bg_papa_dir = Path(".cache_bg_author_paper")
+    
+    target_aid = 'A5040821463'
+    target_name = Authors()[target_aid]['display_name']
+    # fnames=[_ for _ in bg_pap_dir.glob("*jsonl")]
+    fnames=[_ for _ in bg_papa_dir.glob("*jsonl")]
+    fnames_authors=[_ for _ in pap_dir.glob("*jsonl") if _.stem.split("_")[0] == target_aid]
+    
+    # background = []
+    # for fname in fnames:
+    #     # fname=fnames[0]
     #     mydat=read_jsonl(fname)
     #     if mydat is not None and mydat[0] is not None:
     #         for myd in mydat[0]:
     #             if myd is not None:
     #                 if myd['embedding'] is not None:
-    #                     meta.append([myd['title'],myd['s2FieldsOfStudy'][0]['category'] if len(myd['s2FieldsOfStudy']) > 0 else None])
+                    
 
-    # with open(f"test.json", "w") as f:
-    #     json.dump(out[:3000], f)
-    # with open(f"test_meta.json", "w") as f:
-    #     json.dump(meta[:3000], f)
+    embeddings=[]
+    meta=[]
+    for i,fname in enumerate(fnames+fnames_authors):
+        # fname=fnames[0]
+        # fname=fnames_authors[0]
+        
+        # we want a list of list
+        mydat=[read_jsonl(fname)] if i < len(fnames) else read_jsonl(fname)
+
+        if mydat is not None and mydat[0] is not None:
+            for myd in mydat[0]:
+                if myd is not None:
+                    if myd['embedding'] is not None:
+                        year = myd['year'] if i < len(fnames) else int(fname.stem.split("_")[1])
+                        embeddings.append(myd['embedding']['vector'])
+                        meta.append([
+                            myd['title'],
+                            myd['s2FieldsOfStudy'][0]['category'] if len(myd['s2FieldsOfStudy']) > 0 else None,
+                            year,
+                            True if i < len(fnames) else False
+                            ])
+    
+    # ~700D -> 2D
+    embedding2d = reducer.fit_transform(embeddings)
+    
+    # write to disk
+    pd.concat([
+        pd.DataFrame(embedding2d, columns=["x", "y"]),
+        pd.DataFrame(meta, columns=["title", "fos", "year", "is_background"])
+    ], axis=1).to_parquet("embedding.parquet")
+
+
+
+    # BERTOPIC ----------------------------
+
+    # from bertopic import BERTopic
+    # from hdbscan import HDBSCAN
+    
+    # from umap import UMAP
+    
+    
+    # umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric='cosine')
+    # topic_model = BERTopic(embedding_model=embeddings, umap_model=umap_model)
+    # topics, probs = topic_model.fit_transform(embeddings)
+
+    # hdbscan_model = HDBSCAN(min_cluster_size=15, metric='euclidean', cluster_selection_method='eom', prediction_data=True)
+    # topic_model = BERTopic(hdbscan_model=hdbscan_model)
